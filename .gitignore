@@ -1,0 +1,27 @@
+# Sample images and debug output (large, not part of the codebase)
+data/
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Session files (per-image GUI state, not source)
+*.pkl
+
+# Build artifacts / packaged distributions
+*.zip
+.deps_installed
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local Claude Code settings
+.claude/settings.local.json
