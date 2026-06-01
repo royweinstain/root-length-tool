@@ -5,14 +5,16 @@ import numpy as np
 
 from .plates import detect_plates, crop_plate
 from .ruler import detect_ruler
-from .roots import segment_roots, skeletonize_roots, prune_skeleton
+from .roots import (segment_roots, skeletonize_roots, prune_skeleton,
+                    separate_by_plant_body)
 from .marks import detect_marks, auto_detect_mark_color
-from .measure import find_mark_positions_on_skeleton, measure_segments
-from .utils import detect_polarity
+from .measure import (find_mark_positions_on_skeleton, measure_segments,
+                       base_endpoint, assign_marks_to_roots)
+from .utils import detect_polarity, detect_growth_direction
 
 
 def process_image(image_path, mark_color=None, pixels_per_mm=None,
-                   processing_size=1200):
+                   processing_size=1200, growth_direction=None):
     """Process a full image: detect plates, roots, marks, and measure.
 
     Args:
@@ -57,6 +59,7 @@ def process_image(image_path, mark_color=None, pixels_per_mm=None,
             pixels_per_mm=pixels_per_mm,
             processing_size=processing_size,
             polarity=polarity,
+            growth_direction=growth_direction,
         )
         results.append(plate_result)
 
@@ -65,8 +68,13 @@ def process_image(image_path, mark_color=None, pixels_per_mm=None,
 
 def process_single_plate(image, cx, cy, radius, plate_index,
                          mark_color=None, pixels_per_mm=None,
-                         processing_size=1200, polarity="light"):
-    """Process a single plate from the image."""
+                         processing_size=1200, polarity="light",
+                         growth_direction=None):
+    """Process a single plate from the image.
+
+    growth_direction: "up"/"down"/"left"/"right" (plant body -> tip). If None,
+                      auto-detected from green plant bodies / plate geometry.
+    """
 
     # Crop plate at full resolution
     plate_img_full, plate_mask_full = crop_plate(image, cx, cy, radius)
@@ -85,9 +93,20 @@ def process_single_plate(image, cx, cy, radius, plate_index,
         plate_mask = plate_mask_full
         adj_ppmm = pixels_per_mm
 
-    # Segment roots (polarity-aware)
+    # Segment roots (polarity-aware) — this mask still includes green leaves.
     root_mask, labels, num_roots = segment_roots(
         plate_img, plate_mask, polarity=polarity
+    )
+
+    # Determine growth direction (plant body -> tip) so marks are ordered and
+    # tips found correctly regardless of plate orientation. Done BEFORE the
+    # green plant bodies are removed below, since the green is the key cue.
+    if growth_direction is None:
+        growth_direction = detect_growth_direction(plate_img, plate_mask, root_mask)
+
+    # Separate plants fused only through overlapping leaves (no-op without green).
+    root_mask, labels, num_roots = separate_by_plant_body(
+        root_mask, plate_img, plate_mask
     )
 
     # Skeletonize
@@ -106,13 +125,13 @@ def process_single_plate(image, cx, cy, radius, plate_index,
 
     # Find mark positions on skeleton
     mark_positions = find_mark_positions_on_skeleton(
-        skeleton, mark_mask, labels, num_roots
+        skeleton, mark_mask, labels, num_roots, direction=growth_direction
     )
 
     # Measure segments (include root tip as final endpoint)
     measurements = measure_segments(
         mark_positions, skeleton, labels, pixels_per_mm=adj_ppmm,
-        include_tip=False
+        include_tip=False, direction=growth_direction
     )
 
     return {
@@ -121,6 +140,7 @@ def process_single_plate(image, cx, cy, radius, plate_index,
         "plate_radius": radius,
         "processing_scale": proc_scale,
         "polarity": polarity,
+        "growth_direction": growth_direction,
         "roots": measurements,
         "mark_color_used": mark_color,
         "pixels_per_mm": pixels_per_mm,
@@ -134,11 +154,14 @@ def process_single_plate(image, cx, cy, radius, plate_index,
     }
 
 
-def create_debug_overlay(plate_result):
+def create_debug_overlay(plate_result, highlight_root_id=None):
     """Create a visual overlay showing detected roots, skeleton, and marks.
 
     Args:
         plate_result: Result dict from process_single_plate.
+        highlight_root_id: If set, that root is emphasized (bright halo + bold
+                           skeleton + boxed number) so it can be picked out when
+                           splitting/merging. Ignored if it isn't a current root.
 
     Returns:
         BGR image with colored overlays.
@@ -175,23 +198,60 @@ def create_debug_overlay(plate_result):
     # Draw skeleton in white for visibility on colored roots
     img[skeleton > 0] = [255, 255, 255]
 
-    # Draw marks in magenta
-    img[mark_mask > 0] = [255, 0, 255]
+    # Emphasize a highlighted root so it is easy to identify on a busy plate.
+    # Drawn before the marks so the marks stay visible on top of the halo.
+    highlight_present = (
+        highlight_root_id is not None and np.any(labels == highlight_root_id)
+    )
+    if highlight_present:
+        hl_mask = (labels == highlight_root_id).astype(np.uint8) * 255
+        # Bright halo ring around the root body
+        halo = cv2.dilate(hl_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)))
+        ring = cv2.subtract(halo, hl_mask)
+        img[ring > 0] = [0, 255, 255]  # yellow
+        # Re-draw this root's skeleton thicker and bright yellow
+        hl_skel = (skeleton & (labels == highlight_root_id)).astype(np.uint8)
+        hl_skel = cv2.dilate(hl_skel, np.ones((3, 3), np.uint8))
+        img[hl_skel > 0] = [0, 255, 255]
 
-    # Draw root ID numbers near the top of each root's skeleton
+    # Draw marks, colored by their root association so it is visible which mark
+    # belongs where: orange = unassigned (too far / problem), cyan = belongs to
+    # the highlighted root, magenta = assigned to some other root.
+    mark_labels, assignments = assign_marks_to_roots(skeleton, mark_mask, labels)
+    for a in assignments:
+        comp = mark_labels == a["mark_label"]
+        if a["root_id"] <= 0:
+            img[comp] = [0, 140, 255]      # orange — unassigned
+        elif highlight_present and a["root_id"] == highlight_root_id:
+            img[comp] = [255, 255, 0]      # cyan — highlighted root's mark
+        else:
+            img[comp] = [255, 0, 255]      # magenta — assigned elsewhere
+
+    # Draw root ID numbers near the plant-body end of each root's skeleton
     labels = plate_result["labels"]
     num_roots = plate_result["num_roots_detected"]
+    direction = plate_result.get("growth_direction", "down")
     for root_id in range(1, num_roots + 1):
         root_skel = skeleton & (labels == root_id)
         ys, xs = np.where(root_skel)
         if len(ys) == 0:
             continue
-        # Place label near the top-left of the root (closest to the plant body)
-        top_idx = np.argmin(ys)
-        ly, lx = int(ys[top_idx]), int(xs[top_idx])
-        cv2.putText(img, str(root_id), (lx + 5, ly - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-        cv2.putText(img, str(root_id), (lx + 5, ly - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 200), 1)
+        # Place label at the plant-body end of the root (where measurement starts)
+        anchor = base_endpoint(root_skel, direction)
+        ly, lx = anchor if anchor is not None else (int(ys.min()), int(xs[np.argmin(ys)]))
+        if highlight_present and root_id == highlight_root_id:
+            # Boxed, larger label for the highlighted root
+            text = str(root_id)
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+            ox, oy = lx + 5, ly - 5
+            cv2.rectangle(img, (ox - 3, oy - th - 3), (ox + tw + 3, oy + 3),
+                          (0, 0, 0), -1)
+            cv2.putText(img, text, (ox, oy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        else:
+            cv2.putText(img, str(root_id), (lx + 5, ly - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            cv2.putText(img, str(root_id), (lx + 5, ly - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 200), 1)
 
     return img

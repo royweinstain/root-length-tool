@@ -3,62 +3,109 @@
 import cv2
 import numpy as np
 from collections import defaultdict
+from scipy.ndimage import distance_transform_edt
+
+from .utils import direction_to_vector
+
+# A mark is associated with a root only if it lies within this many pixels of
+# that root's skeleton. Marks farther than this are left unassigned.
+MARK_MAX_DIST = 15
 
 
-def find_mark_positions_on_skeleton(skeleton, mark_mask, labels, num_roots):
-    """Find where marks intersect each root's skeleton.
+def assign_marks_to_roots(skeleton, mark_mask, labels, max_dist=MARK_MAX_DIST):
+    """Assign each physical mark to exactly ONE root — its nearest skeleton.
+
+    Each connected component of ``mark_mask`` is one physical mark. It is
+    assigned to the root whose skeleton is closest to it (by the mark's closest
+    pixel), provided that distance is within ``max_dist``; otherwise the mark is
+    left unassigned (root_id 0). This avoids the previous behaviour where a mark
+    near two roots could be counted on both, and makes association explicit so
+    it can be displayed.
+
+    Args:
+        skeleton: Boolean skeleton image.
+        mark_mask: Binary mask of detected marks (0/255).
+        labels: Labeled image of root components (root id per pixel).
+        max_dist: Maximum mark-to-skeleton distance (px) to allow assignment.
+
+    Returns:
+        (mark_labels, assignments) where mark_labels is the labeled mark image
+        and assignments is a list of dicts:
+            {"mark_label": int, "centroid": (y, x),
+             "root_id": int (0 = unassigned), "snapped": (y, x) or None}
+    """
+    num_marks, mark_labels = cv2.connectedComponents(mark_mask)
+    assignments = []
+
+    skel = skeleton.astype(bool)
+    if not skel.any():
+        for ml in range(1, num_marks):
+            ys, xs = np.where(mark_labels == ml)
+            assignments.append({
+                "mark_label": ml,
+                "centroid": (int(ys.mean()), int(xs.mean())),
+                "root_id": 0, "snapped": None,
+            })
+        return mark_labels, assignments
+
+    # For every pixel: distance to the nearest skeleton pixel, and that pixel's
+    # coordinates (so we can read off its root label).
+    dist, (iy, ix) = distance_transform_edt(~skel, return_indices=True)
+
+    for ml in range(1, num_marks):
+        ys, xs = np.where(mark_labels == ml)
+        # Use the mark pixel closest to any skeleton.
+        d = dist[ys, xs]
+        k = int(np.argmin(d))
+        centroid = (int(ys.mean()), int(xs.mean()))
+        if d[k] <= max_dist:
+            sy, sx = int(iy[ys[k], xs[k]]), int(ix[ys[k], xs[k]])
+            root_id = int(labels[sy, sx])
+            snapped = (sy, sx)
+        else:
+            root_id, snapped = 0, None
+        assignments.append({
+            "mark_label": ml, "centroid": centroid,
+            "root_id": root_id, "snapped": snapped,
+        })
+
+    return mark_labels, assignments
+
+
+def find_mark_positions_on_skeleton(skeleton, mark_mask, labels, num_roots,
+                                    direction="down"):
+    """Find each root's marks (one mark -> one nearest root) ordered along it.
 
     Args:
         skeleton: Boolean skeleton image.
         mark_mask: Binary mask of detected marks (0/255).
         labels: Labeled image of root components.
         num_roots: Number of roots.
+        direction: Growth direction (plant body -> tip): "up"/"down"/"left"/"right".
+                   Marks are ordered from the plant-body end outward.
 
     Returns:
         Dict mapping root_id -> list of (y, x) mark positions ordered along skeleton.
     """
-    # Dilate marks to ensure intersection with thin skeleton
-    # Radius of 15px covers marks that are near but not exactly on the skeleton
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    marks_dilated = cv2.dilate(mark_mask, kernel, iterations=1)
+    _, assignments = assign_marks_to_roots(skeleton, mark_mask, labels)
 
-    # Find intersection pixels
-    intersection = skeleton & (marks_dilated > 0)
+    per_root = defaultdict(list)
+    for a in assignments:
+        if a["root_id"] > 0 and a["snapped"] is not None:
+            per_root[a["root_id"]].append(a["snapped"])
 
-    mark_positions = defaultdict(list)
-
-    for root_id in range(1, num_roots + 1):
+    mark_positions = {}
+    for root_id, points in per_root.items():
         root_skeleton = skeleton & (labels == root_id)
-        root_intersections = intersection & (labels == root_id)
+        mark_positions[root_id] = _order_points_along_skeleton(
+            points, root_skeleton, direction
+        )
 
-        if not np.any(root_intersections):
-            continue
-
-        # Get intersection pixel coordinates
-        ys, xs = np.where(root_intersections)
-        if len(ys) == 0:
-            continue
-
-        # Cluster nearby intersection points (a single mark may hit multiple skeleton pixels)
-        points = np.column_stack((ys, xs))
-        clusters = _cluster_points(points, min_dist=15)
-
-        # Get the centroid of each cluster
-        centroids = []
-        for cluster in clusters:
-            cy = int(np.mean([p[0] for p in cluster]))
-            cx = int(np.mean([p[1] for p in cluster]))
-            centroids.append((cy, cx))
-
-        # Order centroids along the skeleton path
-        ordered = _order_points_along_skeleton(centroids, root_skeleton)
-        mark_positions[root_id] = ordered
-
-    return dict(mark_positions)
+    return mark_positions
 
 
 def measure_segments(mark_positions, skeleton, labels, pixels_per_mm=None,
-                     include_tip=False):
+                     include_tip=False, direction="down"):
     """Measure arc-length between consecutive marks along each root.
 
     Args:
@@ -88,7 +135,7 @@ def measure_segments(mark_positions, skeleton, labels, pixels_per_mm=None,
         # Optionally add the root tip as the final point
         tip_included = False
         if include_tip and len(positions) >= 1:
-            tip = _find_root_tip(root_skel)
+            tip = _find_root_tip(root_skel, direction)
             if tip is not None:
                 last_mark = positions[-1]
                 tip_dist = np.sqrt((tip[0] - last_mark[0])**2 +
@@ -123,40 +170,67 @@ def measure_segments(mark_positions, skeleton, labels, pixels_per_mm=None,
             "tip_included": tip_included,
         }
 
+    # Include every labeled root, even those with no detected marks, so small
+    # pieces (e.g. from splitting/merging) stay listed and can be identified.
+    for root_id in np.unique(labels):
+        rid = int(root_id)
+        if rid == 0 or rid in results:
+            continue
+        results[rid] = {
+            "total_length_mm": 0.0,
+            "segments": [],
+            "mark_count": 0,
+            "tip_included": False,
+        }
+
     return results
 
 
-def _find_root_tip(skeleton):
-    """Find the root tip — the endpoint farthest from the plant body.
-
-    Roots typically grow downward or rightward. The tip is the endpoint
-    farthest from the topmost/leftmost point of the skeleton (where the
-    seed/plant body is).
-
-    Returns (y, x) tuple or None.
-    """
+def _skeleton_endpoints(skeleton):
+    """Return (ys, xs) of endpoint pixels (exactly one neighbor) in skeleton."""
     skel = skeleton.astype(np.uint8)
     kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
     neighbors = cv2.filter2D(skel, -1, kernel)
     endpoint_mask = (skel > 0) & (neighbors == 1)
+    return np.where(endpoint_mask)
 
-    ys, xs = np.where(endpoint_mask)
+
+def base_endpoint(skeleton, direction="down"):
+    """Find the plant-body end of a root skeleton for the given growth direction.
+
+    The body endpoint is the one that is most "upstream" — i.e. has the smallest
+    projection onto the growth-direction vector. Falls back to all skeleton
+    pixels if there are no clean endpoints.
+
+    Returns (y, x) or None.
+    """
+    dy, dx = direction_to_vector(direction)
+    ys, xs = _skeleton_endpoints(skeleton)
+    if len(ys) == 0:
+        ys, xs = np.where(skeleton > 0)
+        if len(ys) == 0:
+            return None
+    proj = ys * dy + xs * dx
+    idx = int(np.argmin(proj))
+    return (int(ys[idx]), int(xs[idx]))
+
+
+def _find_root_tip(skeleton, direction="down"):
+    """Find the root tip — the endpoint farthest along the growth direction.
+
+    The tip is the endpoint with the largest projection onto the growth-direction
+    vector (plant body -> tip). Works for any orientation.
+
+    Returns (y, x) tuple or None.
+    """
+    dy, dx = direction_to_vector(direction)
+    ys, xs = _skeleton_endpoints(skeleton)
     if len(ys) == 0:
         return None
-
     if len(ys) == 1:
         return (int(ys[0]), int(xs[0]))
-
-    # The root tip is the endpoint farthest from the skeleton's center of mass
-    # weighted toward the top (where the plant body is)
-    all_ys, all_xs = np.where(skel > 0)
-    # Plant body is near the top-left of the skeleton (min y, min x)
-    body_y = np.percentile(all_ys, 10)
-    body_x = np.percentile(all_xs, 10)
-
-    # Find the endpoint farthest from the plant body
-    dists = (ys - body_y)**2 + (xs - body_x)**2
-    max_idx = np.argmax(dists)
+    proj = ys * dy + xs * dx
+    max_idx = int(np.argmax(proj))
     return (int(ys[max_idx]), int(xs[max_idx]))
 
 
@@ -198,12 +272,13 @@ def _cluster_points(points, min_dist=15):
     return clusters
 
 
-def _order_points_along_skeleton(points, skeleton):
+def _order_points_along_skeleton(points, skeleton, direction="down"):
     """Order mark positions along the skeleton from plant body to tip.
 
-    Uses BFS from the topmost endpoint (plant body) to compute the
-    shortest-path distance to each mark, then sorts by distance.
-    This handles branching skeletons correctly.
+    Uses BFS from the plant-body endpoint (the endpoint most upstream relative
+    to the growth direction) to compute the shortest-path distance to each mark,
+    then sorts by distance. This handles branching skeletons and any growth
+    orientation correctly.
     """
     if len(points) <= 1:
         return points
@@ -216,18 +291,10 @@ def _order_points_along_skeleton(points, skeleton):
     if len(ys) == 0:
         return points
 
-    # Find the plant body endpoint (topmost skeleton endpoint)
-    kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
-    neighbors = cv2.filter2D(skel, -1, kernel)
-    ep_mask = (skel > 0) & (neighbors == 1)
-    ep_ys, ep_xs = np.where(ep_mask)
-
-    if len(ep_ys) > 0:
-        top_idx = np.argmin(ep_ys)
-        start = (int(ep_ys[top_idx]), int(ep_xs[top_idx]))
-    else:
-        top_idx = np.argmin(ys)
-        start = (int(ys[top_idx]), int(xs[top_idx]))
+    # Anchor BFS at the plant-body endpoint for this growth direction.
+    start = base_endpoint(skel, direction)
+    if start is None:
+        return points
 
     # BFS from plant body to compute distance to every skeleton pixel
     dist_map = np.full((h, w), -1.0)

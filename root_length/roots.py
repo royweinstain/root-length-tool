@@ -4,6 +4,8 @@ import cv2
 import numpy as np
 from skimage.morphology import skeletonize, remove_small_objects
 
+from .utils import _GREEN_LOWER, _GREEN_UPPER
+
 
 def segment_roots(plate_image, plate_mask=None, polarity="light",
                    block_size=51, c_offset=10,
@@ -113,6 +115,51 @@ def segment_roots(plate_image, plate_mask=None, polarity="light",
 
     num_roots = root_id
     return filtered, labels, num_roots
+
+
+def separate_by_plant_body(root_mask, plate_image, plate_mask=None,
+                           min_green_area=300, green_dilate=7, min_root_area=200):
+    """Separate plants fused only through their overlapping green leaves.
+
+    Seedlings planted in a tight row often have cotyledons/leaves that touch,
+    which makes connected-component labeling merge several plants into one
+    'root'. Because the leaves are green and the roots are not, removing the
+    green plant-body mass before labeling separates the individual roots while
+    leaving each root strand intact.
+
+    This is a no-op when little/no green is present (e.g. dark-background images
+    or plates without visible leaves), so it is safe to always apply. It does
+    NOT resolve roots that physically cross out in the open — those stay merged
+    and are left to the manual Split tool.
+
+    Args:
+        root_mask: Binary root mask (0/255), typically still including leaves.
+        plate_image: BGR image of the plate (for green detection).
+        plate_mask: Optional plate-area mask to restrict green detection.
+        min_green_area: Minimum green pixel count before separation kicks in.
+        green_dilate: Dilation (px) applied to the green mass so thin leaf
+                      bridges between neighbours are fully cut.
+        min_root_area: Leaf/noise fragments at or below this size are dropped.
+
+    Returns:
+        (root_mask, labels, num_roots) after separation.
+    """
+    hsv = cv2.cvtColor(plate_image, cv2.COLOR_BGR2HSV)
+    green = cv2.inRange(hsv, _GREEN_LOWER, _GREEN_UPPER)
+    if plate_mask is not None:
+        green = cv2.bitwise_and(green, plate_mask)
+
+    if np.count_nonzero(green) >= min_green_area:
+        if green_dilate > 0:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (green_dilate, green_dilate))
+            green = cv2.dilate(green, k)
+        root_mask = cv2.bitwise_and(root_mask, cv2.bitwise_not(green))
+        # Drop small leaf/noise fragments left behind by the cut.
+        cleaned = remove_small_objects(root_mask > 0, max_size=min_root_area)
+        root_mask = (cleaned.astype(np.uint8)) * 255
+
+    num_labels, labels = cv2.connectedComponents(root_mask)
+    return root_mask, labels, num_labels - 1
 
 
 def skeletonize_roots(binary_mask):

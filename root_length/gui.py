@@ -69,6 +69,8 @@ class RootLengthGUI:
         self.plate_results = []
         self.current_plate_idx = 0
         self.display_scale = 1.0  # scale from plate image coords to canvas coords
+        self.view_rotation = 0  # display-only rotation in degrees (0/90/180/270)
+        self._orig_hw = None  # (H, W) of the un-rotated overlay image
         self.photo_image = None  # keep reference to prevent GC
         self.undo_stack = []  # list of (plate_idx, snapshot) tuples
         self.MAX_UNDO = 20
@@ -81,6 +83,8 @@ class RootLengthGUI:
         self.extend_points = []  # list of (y, x) points clicked so far
         self.add_root_mode = False
         self.add_root_points = []  # list of (y, x) points for new root
+        self.highlighted_root_id = None  # root highlighted from the table
+        self._hover_root_id = None  # last row hovered in the table
 
         self._build_ui()
 
@@ -103,27 +107,46 @@ class RootLengthGUI:
         self.next_btn = ttk.Button(row1, text="Next Plate >", command=self._next_plate, state=tk.DISABLED)
         self.next_btn.pack(side=tk.LEFT, padx=2)
 
-        ttk.Separator(row1, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        rotate_btn = ttk.Button(row1, text="Rotate 90°", command=self._rotate_view)
+        rotate_btn.pack(side=tk.LEFT, padx=2)
+        ToolTip(rotate_btn, "Rotate the view 90° clockwise (display only).\n"
+                            "Measurements are unaffected.")
 
-        ttk.Label(row1, text="Mark color:").pack(side=tk.LEFT)
+        # Row 1b: Detection settings (own row so the toolbar never overflows)
+        row_det = ttk.Frame(self.root)
+        row_det.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(2, 0))
+
+        ttk.Label(row_det, text="Mark color:").pack(side=tk.LEFT)
         self.color_var = tk.StringVar(value="auto")
-        color_combo = ttk.Combobox(row1, textvariable=self.color_var,
+        color_combo = ttk.Combobox(row_det, textvariable=self.color_var,
                                    values=["auto", "red", "blue", "green"],
                                    state="readonly", width=8)
         color_combo.pack(side=tk.LEFT, padx=2)
         ToolTip(color_combo, "Select mark color to detect.\n'auto' tries to pick the best color.")
 
-        btn = ttk.Button(row1, text="Re-detect", command=self._redetect_marks)
+        btn = ttk.Button(row_det, text="Re-detect", command=self._redetect_marks)
         btn.pack(side=tk.LEFT, padx=2)
         ToolTip(btn, "Re-run mark detection with the\nselected color. Resets all corrections.")
 
-        ttk.Separator(row1, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Separator(row_det, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
 
-        ttk.Label(row1, text="Scale (px/mm):").pack(side=tk.LEFT)
+        ttk.Label(row_det, text="Growth:").pack(side=tk.LEFT)
+        self.direction_var = tk.StringVar(value="down")
+        dir_combo = ttk.Combobox(row_det, textvariable=self.direction_var,
+                                 values=["up", "down", "left", "right"],
+                                 state="readonly", width=7)
+        dir_combo.pack(side=tk.LEFT, padx=2)
+        dir_combo.bind("<<ComboboxSelected>>", self._on_direction_change)
+        ToolTip(dir_combo, "Direction roots grow (plant body → tip).\n"
+                           "Auto-detected per plate; override here if\nmark ordering looks wrong.")
+
+        ttk.Separator(row_det, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+
+        ttk.Label(row_det, text="Scale (px/mm):").pack(side=tk.LEFT)
         self.scale_var = tk.StringVar(value="auto")
-        self.scale_entry = ttk.Entry(row1, textvariable=self.scale_var, width=8)
+        self.scale_entry = ttk.Entry(row_det, textvariable=self.scale_var, width=8)
         self.scale_entry.pack(side=tk.LEFT, padx=2)
-        btn = ttk.Button(row1, text="Apply Scale", command=self._apply_scale)
+        btn = ttk.Button(row_det, text="Apply Scale", command=self._apply_scale)
         btn.pack(side=tk.LEFT, padx=2)
         ToolTip(btn, "Apply a manual px/mm scale to all\nplates and recalculate measurements.")
 
@@ -145,7 +168,13 @@ class RootLengthGUI:
 
         self.add_root_btn = ttk.Button(row2, text="Add Root", command=self._toggle_add_root_mode)
         self.add_root_btn.pack(side=tk.LEFT, padx=2)
-        ToolTip(self.add_root_btn, "Manually trace a root that was not detected.\nClick points along the root path.\nRight-click or Enter to finish.")
+        ToolTip(self.add_root_btn, "Create a root that was not detected.\nClick along the root path (or a single click to\ndrop a start seed, then use Extend Root).\nRight-click or Enter to finish.")
+
+        self.delete_btn = ttk.Button(row2, text="Delete Root", command=self._delete_selected_root)
+        self.delete_btn.pack(side=tk.LEFT, padx=2)
+        ToolTip(self.delete_btn, "Delete the selected root (e.g. a stray side-root\n"
+                                 "piece). Select a row in the table, then click this\n"
+                                 "or press the Delete key. Undo with Ctrl+Z.")
 
         ttk.Separator(row2, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
 
@@ -208,6 +237,14 @@ class RootLengthGUI:
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Highlight the corresponding root on the canvas when a row is
+        # clicked/selected, or hovered (helps identify roots when splitting/merging).
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.tree.bind("<Motion>", self._on_tree_hover)
+        self.tree.bind("<Leave>", self._on_tree_leave)
+        self.tree.bind("<Delete>", self._delete_selected_root)
+        self.tree.bind("<BackSpace>", self._delete_selected_root)
 
         # Status bar
         self.status_var = tk.StringVar(value="Ready")
@@ -275,8 +312,15 @@ class RootLengthGUI:
         self.prev_btn.config(state=tk.NORMAL if self.current_plate_idx > 0 else tk.DISABLED)
         self.next_btn.config(state=tk.NORMAL if self.current_plate_idx < n_plates - 1 else tk.DISABLED)
 
-        # Draw overlay on canvas
-        overlay = create_debug_overlay(pr)
+        # Sync growth-direction selector to this plate's detected/overridden value
+        self.direction_var.set(pr.get("growth_direction", "down"))
+
+        # Draw overlay on canvas (clear any stale highlight from another plate
+        # or a structural edit, since root IDs may have changed)
+        if self.highlighted_root_id is not None and \
+                self.highlighted_root_id not in pr["roots"]:
+            self.highlighted_root_id = None
+        overlay = create_debug_overlay(pr, highlight_root_id=self.highlighted_root_id)
         self._display_image(overlay)
 
         # Update measurements table
@@ -292,7 +336,21 @@ class RootLengthGUI:
         )
 
     def _display_image(self, bgr_image):
-        """Show a BGR OpenCV image on the canvas, scaled to fit."""
+        """Show a BGR OpenCV image on the canvas, scaled to fit.
+
+        The image is rotated for display only (view_rotation); all stored data
+        and click handling stay in the original image coordinate system.
+        """
+        # Remember the un-rotated size so click<->image mapping can invert it.
+        self._orig_hw = bgr_image.shape[:2]
+
+        if self.view_rotation == 90:
+            bgr_image = cv2.rotate(bgr_image, cv2.ROTATE_90_CLOCKWISE)
+        elif self.view_rotation == 180:
+            bgr_image = cv2.rotate(bgr_image, cv2.ROTATE_180)
+        elif self.view_rotation == 270:
+            bgr_image = cv2.rotate(bgr_image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
         rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(rgb)
 
@@ -324,14 +382,122 @@ class RootLengthGUI:
         self.tree.heading("total_mm", text=f"Total ({unit})")
         self.tree.heading("segments", text=f"Segments ({unit})")
 
+        # Unmeasured pieces (fewer than 2 marks) are shown greyed out
+        self.tree.tag_configure("unmeasured", foreground="#999999")
+
         for rid in sorted(pr["roots"].keys()):
             data = pr["roots"][rid]
             marks = data["mark_count"]
             total = f"{data['total_length_mm']:.1f}"
             segs = ", ".join(f"{s:.1f}" for s in data["segments"])
+            tags = ("unmeasured",) if marks < 2 else ()
             self.tree.insert("", tk.END, values=(
                 rid, marks, total, segs
-            ))
+            ), tags=tags)
+
+    # -------------------------------------------------------- Root highlight
+    def _redraw_overlay(self):
+        """Re-render just the canvas overlay (keeps the table/selection intact)."""
+        if not self.plate_results:
+            return
+        pr = self.plate_results[self.current_plate_idx]
+        overlay = create_debug_overlay(pr, highlight_root_id=self.highlighted_root_id)
+        self._display_image(overlay)
+
+    def _set_highlight(self, root_id):
+        """Highlight a root on the canvas if it isn't already highlighted."""
+        if root_id == self.highlighted_root_id:
+            return
+        self.highlighted_root_id = root_id
+        self._redraw_overlay()
+
+    def _root_id_from_row(self, row_item):
+        """Parse the root ID from a treeview row, or None."""
+        if not row_item:
+            return None
+        vals = self.tree.item(row_item, "values")
+        if not vals:
+            return None
+        try:
+            return int(vals[0])
+        except (ValueError, TypeError):
+            return None
+
+    def _on_tree_select(self, event=None):
+        """Clicking/selecting a table row highlights that root."""
+        sel = self.tree.selection()
+        rid = self._root_id_from_row(sel[0]) if sel else None
+        if rid is not None:
+            self._set_highlight(rid)
+
+    def _on_tree_hover(self, event):
+        """Hovering a table row previews its highlight."""
+        row = self.tree.identify_row(event.y)
+        rid = self._root_id_from_row(row)
+        if rid == self._hover_root_id:
+            return
+        self._hover_root_id = rid
+        if rid is not None:
+            self._set_highlight(rid)
+
+    def _on_tree_leave(self, event=None):
+        """On leaving the table, fall back to the selected row's highlight."""
+        self._hover_root_id = None
+        sel = self.tree.selection()
+        rid = self._root_id_from_row(sel[0]) if sel else None
+        self._set_highlight(rid)
+
+    # -------------------------------------------------------- Delete root
+    def _delete_selected_root(self, event=None):
+        """Delete the root currently selected in the table (or highlighted)."""
+        if not self.plate_results:
+            return
+        sel = self.tree.selection()
+        rid = self._root_id_from_row(sel[0]) if sel else self.highlighted_root_id
+        if rid is None:
+            self.status_var.set("Select a root in the table to delete.")
+            return
+
+        pr = self.plate_results[self.current_plate_idx]
+        data = pr["roots"].get(rid)
+        # Confirm only when deleting a measured root, to protect real data.
+        if data is not None and data["mark_count"] >= 2:
+            if not messagebox.askyesno(
+                "Delete root",
+                f"Root {rid} has {data['mark_count']} marks "
+                f"({data['total_length_mm']:.1f}). Delete it anyway?"
+            ):
+                return
+
+        self._perform_delete(rid)
+
+    def _perform_delete(self, rid):
+        """Remove a root component (mask, skeleton, marks) and re-label/measure."""
+        self._save_snapshot()
+        pr = self.plate_results[self.current_plate_idx]
+
+        region = pr["labels"] == rid
+        if not np.any(region):
+            self.status_var.set(f"Root {rid} not found.")
+            return
+
+        # Remove the root's pixels, its skeleton, and any marks sitting on it.
+        pr["root_mask"][region] = 0
+        pr["skeleton"][region] = False
+        pr["mark_mask"][region] = 0
+
+        # Re-label remaining components (IDs are renumbered, like split/merge).
+        num_labels, new_labels = cv2.connectedComponents(pr["root_mask"])
+        pr["labels"] = new_labels
+        pr["num_roots_detected"] = num_labels - 1
+
+        if self.highlighted_root_id == rid:
+            self.highlighted_root_id = None
+
+        self.status_var.set(
+            f"Deleted root {rid} — now {pr['num_roots_detected']} roots"
+        )
+        self._remeasure()
 
     # -------------------------------------------------------- Navigation
     def _prev_plate(self):
@@ -369,12 +535,14 @@ class RootLengthGUI:
 
             adj_ppmm = ppmm * pr["processing_scale"]
 
+            direction = pr.get("growth_direction", "down")
             mark_positions = find_mark_positions_on_skeleton(
-                pr["skeleton"], pr["mark_mask"], pr["labels"], pr["num_roots_detected"]
+                pr["skeleton"], pr["mark_mask"], pr["labels"], pr["num_roots_detected"],
+                direction=direction
             )
             measurements = measure_segments(
                 mark_positions, pr["skeleton"], pr["labels"],
-                pixels_per_mm=adj_ppmm, include_tip=False
+                pixels_per_mm=adj_ppmm, include_tip=False, direction=direction
             )
             pr["roots"] = measurements
 
@@ -394,6 +562,7 @@ class RootLengthGUI:
             "mark_mask": pr["mark_mask"].copy(),
             "num_roots_detected": pr["num_roots_detected"],
             "roots": {k: dict(v) for k, v in pr["roots"].items()},
+            "growth_direction": pr.get("growth_direction", "down"),
         }
         self.undo_stack.append((self.current_plate_idx, snapshot))
         if len(self.undo_stack) > self.MAX_UNDO:
@@ -413,17 +582,54 @@ class RootLengthGUI:
         pr["mark_mask"] = snapshot["mark_mask"]
         pr["num_roots_detected"] = snapshot["num_roots_detected"]
         pr["roots"] = snapshot["roots"]
+        pr["growth_direction"] = snapshot.get("growth_direction", "down")
 
         self.current_plate_idx = plate_idx
         self.status_var.set("Undone")
         self._show_current_plate()
 
+    # ------------------------------------------------ View rotation
+    def _rotate_view(self):
+        """Rotate the displayed plate 90° clockwise (display only)."""
+        if not self.plate_results:
+            return
+        self.view_rotation = (self.view_rotation + 90) % 360
+        self.status_var.set(f"View rotated to {self.view_rotation}° (display only)")
+        self._redraw_overlay()
+
     # ------------------------------------------------ Mark editing
     def _canvas_to_image_coords(self, canvas_x, canvas_y):
-        """Convert canvas click coordinates to plate image pixel coordinates."""
-        img_x = int(canvas_x / self.display_scale)
-        img_y = int(canvas_y / self.display_scale)
-        return img_y, img_x  # return as (row, col)
+        """Convert canvas click coords to original (un-rotated) image (row, col)."""
+        scale = self.display_scale
+        # Position within the rotated, displayed image
+        rr = canvas_y / scale
+        cc = canvas_x / scale
+        rot = self.view_rotation
+        if self._orig_hw is None or rot == 0:
+            return int(rr), int(cc)
+        h, w = self._orig_hw
+        if rot == 90:
+            r, c = h - 1 - cc, rr
+        elif rot == 180:
+            r, c = h - 1 - rr, w - 1 - cc
+        else:  # 270
+            r, c = cc, w - 1 - rr
+        return int(r), int(c)
+
+    def _image_to_canvas(self, y, x):
+        """Convert original image (row=y, col=x) to canvas (x, y) for drawing."""
+        scale = self.display_scale
+        rot = self.view_rotation
+        if self._orig_hw is None or rot == 0:
+            return int(x * scale), int(y * scale)
+        h, w = self._orig_hw
+        if rot == 90:
+            rr, cc = x, h - 1 - y
+        elif rot == 180:
+            rr, cc = h - 1 - y, w - 1 - x
+        else:  # 270
+            rr, cc = w - 1 - x, y
+        return int(cc * scale), int(rr * scale)
 
     def _on_left_click(self, event):
         """Left-click: add mark (normal mode) or set split points (split mode)."""
@@ -457,7 +663,7 @@ class RootLengthGUI:
             self._finish_extend()
             return
 
-        if self.add_root_mode and len(self.add_root_points) >= 2:
+        if self.add_root_mode and len(self.add_root_points) >= 1:
             self._finish_add_root()
             return
 
@@ -518,9 +724,11 @@ class RootLengthGUI:
     def _remeasure(self):
         """Re-run mark position finding and measurement on the current plate."""
         pr = self.plate_results[self.current_plate_idx]
+        direction = pr.get("growth_direction", "down")
 
         mark_positions = find_mark_positions_on_skeleton(
-            pr["skeleton"], pr["mark_mask"], pr["labels"], pr["num_roots_detected"]
+            pr["skeleton"], pr["mark_mask"], pr["labels"], pr["num_roots_detected"],
+            direction=direction
         )
 
         adj_ppmm = pr["pixels_per_mm"]
@@ -529,7 +737,7 @@ class RootLengthGUI:
 
         measurements = measure_segments(
             mark_positions, pr["skeleton"], pr["labels"],
-            pixels_per_mm=adj_ppmm, include_tip=False
+            pixels_per_mm=adj_ppmm, include_tip=False, direction=direction
         )
         pr["roots"] = measurements
 
@@ -564,8 +772,7 @@ class RootLengthGUI:
             self.split_start = (y, x)
             self.status_var.set(f"SPLIT MODE: first point set at ({x}, {y}). Click the second point to cut.")
             # Draw a small marker on the canvas
-            cx = int(x * self.display_scale)
-            cy = int(y * self.display_scale)
+            cx, cy = self._image_to_canvas(y, x)
             self.canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4,
                                     fill="red", outline="white", tags="split_marker")
         else:
@@ -605,8 +812,9 @@ class RootLengthGUI:
         skeleton = prune_skeleton(skeleton, min_branch_length=8)
 
         # Re-detect marks on new skeleton
+        direction = pr.get("growth_direction", "down")
         mark_positions = find_mark_positions_on_skeleton(
-            skeleton, mark_mask, new_labels, num_roots
+            skeleton, mark_mask, new_labels, num_roots, direction=direction
         )
 
         # Re-measure
@@ -616,7 +824,7 @@ class RootLengthGUI:
 
         measurements = measure_segments(
             mark_positions, skeleton, new_labels,
-            pixels_per_mm=adj_ppmm, include_tip=False
+            pixels_per_mm=adj_ppmm, include_tip=False, direction=direction
         )
 
         # Update plate result
@@ -752,8 +960,9 @@ class RootLengthGUI:
         new_skeleton = prune_skeleton(new_skeleton, min_branch_length=8)
 
         # Re-detect mark positions and measure
+        direction = pr.get("growth_direction", "down")
         mark_positions = find_mark_positions_on_skeleton(
-            new_skeleton, mark_mask, new_labels, num_roots
+            new_skeleton, mark_mask, new_labels, num_roots, direction=direction
         )
 
         adj_ppmm = pr["pixels_per_mm"]
@@ -762,7 +971,7 @@ class RootLengthGUI:
 
         measurements = measure_segments(
             mark_positions, new_skeleton, new_labels,
-            pixels_per_mm=adj_ppmm, include_tip=False
+            pixels_per_mm=adj_ppmm, include_tip=False, direction=direction
         )
 
         # Update plate result
@@ -816,8 +1025,7 @@ class RootLengthGUI:
             self.extend_root_id = root_id
             self.extend_points = [(y, x)]
             # Draw marker
-            cx = int(x * self.display_scale)
-            cy = int(y * self.display_scale)
+            cx, cy = self._image_to_canvas(y, x)
             self.canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4,
                                     fill="lime", outline="white", tags="extend_marker")
             self.status_var.set(
@@ -830,14 +1038,12 @@ class RootLengthGUI:
             # Subsequent clicks: add points along the extension
             self.extend_points.append((y, x))
             # Draw marker and line to previous point
-            cx = int(x * self.display_scale)
-            cy = int(y * self.display_scale)
+            cx, cy = self._image_to_canvas(y, x)
             self.canvas.create_oval(cx - 3, cy - 3, cx + 3, cy + 3,
                                     fill="lime", outline="white", tags="extend_marker")
             # Draw line from previous point
             prev_y, prev_x = self.extend_points[-2]
-            pcx = int(prev_x * self.display_scale)
-            pcy = int(prev_y * self.display_scale)
+            pcx, pcy = self._image_to_canvas(prev_y, prev_x)
             self.canvas.create_line(pcx, pcy, cx, cy, fill="lime", width=2, tags="extend_marker")
             self.status_var.set(
                 f"EXTEND MODE: {len(self.extend_points)} points. "
@@ -890,8 +1096,9 @@ class RootLengthGUI:
         new_skeleton = prune_skeleton(new_skeleton, min_branch_length=8)
 
         # Re-detect mark positions and measure
+        direction = pr.get("growth_direction", "down")
         mark_positions = find_mark_positions_on_skeleton(
-            new_skeleton, mark_mask, new_labels, num_roots
+            new_skeleton, mark_mask, new_labels, num_roots, direction=direction
         )
 
         adj_ppmm = pr["pixels_per_mm"]
@@ -900,7 +1107,7 @@ class RootLengthGUI:
 
         measurements = measure_segments(
             mark_positions, new_skeleton, new_labels,
-            pixels_per_mm=adj_ppmm, include_tip=False
+            pixels_per_mm=adj_ppmm, include_tip=False, direction=direction
         )
 
         # Update plate result
@@ -933,7 +1140,7 @@ class RootLengthGUI:
         if self.add_root_mode:
             self.add_root_btn.config(text="Cancel Add Root")
             self.canvas.config(cursor="tcross")
-            self.status_var.set("ADD ROOT: click points along the root path. Right-click or Enter to finish.")
+            self.status_var.set("ADD ROOT: click along the root path, or a single click for a start seed. Right-click or Enter to finish.")
             self.root.bind("<Return>", self._finish_add_root)
         else:
             self.add_root_btn.config(text="Add Root")
@@ -947,16 +1154,14 @@ class RootLengthGUI:
         self.add_root_points.append((y, x))
 
         # Draw marker
-        cx = int(x * self.display_scale)
-        cy = int(y * self.display_scale)
+        cx, cy = self._image_to_canvas(y, x)
         self.canvas.create_oval(cx - 3, cy - 3, cx + 3, cy + 3,
                                 fill="yellow", outline="white", tags="add_root_marker")
 
         # Draw line from previous point
         if len(self.add_root_points) >= 2:
             prev_y, prev_x = self.add_root_points[-2]
-            pcx = int(prev_x * self.display_scale)
-            pcy = int(prev_y * self.display_scale)
+            pcx, pcy = self._image_to_canvas(prev_y, prev_x)
             self.canvas.create_line(pcx, pcy, cx, cy, fill="yellow", width=2,
                                     tags="add_root_marker")
 
@@ -970,8 +1175,8 @@ class RootLengthGUI:
         self.root.unbind("<Return>")
         self.canvas.delete("add_root_marker")
 
-        if len(self.add_root_points) < 2:
-            self.status_var.set("Need at least 2 points to add a root. Cancelled.")
+        if len(self.add_root_points) < 1:
+            self.status_var.set("No points placed. Add root cancelled.")
             self.add_root_mode = False
             self.add_root_points = []
             self.add_root_btn.config(text="Add Root")
@@ -999,6 +1204,12 @@ class RootLengthGUI:
             pt2 = (self.add_root_points[i + 1][1], self.add_root_points[i + 1][0])
             cv2.line(root_mask, pt1, pt2, 255, self.ADD_ROOT_LINE_THICKNESS)
 
+        # Single click = drop a small seed stub. It becomes a valid starting
+        # point so the Extend Root tool can trace the rest of the root.
+        if len(self.add_root_points) == 1:
+            sy, sx = self.add_root_points[0]
+            cv2.circle(root_mask, (sx, sy), self.ADD_ROOT_LINE_THICKNESS, 255, -1)
+
         # Re-label connected components
         num_labels, new_labels = cv2.connectedComponents(root_mask)
         num_roots = num_labels - 1
@@ -1009,8 +1220,9 @@ class RootLengthGUI:
         new_skeleton = prune_skeleton(new_skeleton, min_branch_length=8)
 
         # Re-detect mark positions and measure
+        direction = pr.get("growth_direction", "down")
         mark_positions = find_mark_positions_on_skeleton(
-            new_skeleton, mark_mask, new_labels, num_roots
+            new_skeleton, mark_mask, new_labels, num_roots, direction=direction
         )
 
         adj_ppmm = pr["pixels_per_mm"]
@@ -1019,7 +1231,7 @@ class RootLengthGUI:
 
         measurements = measure_segments(
             mark_positions, new_skeleton, new_labels,
-            pixels_per_mm=adj_ppmm, include_tip=False
+            pixels_per_mm=adj_ppmm, include_tip=False, direction=direction
         )
 
         # Update plate result
@@ -1028,10 +1240,16 @@ class RootLengthGUI:
         pr["skeleton"] = new_skeleton
         pr["roots"] = measurements
 
-        self.status_var.set(
-            f"Added new root with {len(self.add_root_points)} points — "
-            f"now {num_roots} roots detected"
-        )
+        if len(self.add_root_points) == 1:
+            self.status_var.set(
+                f"Placed root seed — now {num_roots} roots. "
+                f"Use Extend Root to trace the rest."
+            )
+        else:
+            self.status_var.set(
+                f"Added new root with {len(self.add_root_points)} points — "
+                f"now {num_roots} roots detected"
+            )
         self._show_current_plate()
 
     # ------------------------------------------------ Motivation
@@ -1072,6 +1290,22 @@ class RootLengthGUI:
     def _show_motivation(self):
         msg = random.choice(self._MOTIVATIONS)
         self.status_var.set(msg)
+
+    # ----------------------------------------------- Growth direction
+    def _on_direction_change(self, event=None):
+        """Override the growth direction for the current plate and re-measure."""
+        if not self.plate_results:
+            return
+        pr = self.plate_results[self.current_plate_idx]
+        new_dir = self.direction_var.get()
+        if new_dir == pr.get("growth_direction"):
+            return
+        self._save_snapshot()
+        pr["growth_direction"] = new_dir
+        self.status_var.set(
+            f"Growth direction set to '{new_dir}' for plate {self.current_plate_idx + 1}"
+        )
+        self._remeasure()
 
     # ----------------------------------------------- Re-detect marks
     def _redetect_marks(self):
@@ -1125,6 +1359,7 @@ class RootLengthGUI:
                 "mark_color_used": pr["mark_color_used"],
                 "pixels_per_mm": pr["pixels_per_mm"],
                 "num_roots_detected": pr["num_roots_detected"],
+                "growth_direction": pr.get("growth_direction", "down"),
                 "root_mask": pr["root_mask"],
                 "labels": pr["labels"],
                 "skeleton": pr["skeleton"],
@@ -1190,6 +1425,7 @@ class RootLengthGUI:
                 "mark_color_used": saved["mark_color_used"],
                 "pixels_per_mm": saved["pixels_per_mm"],
                 "num_roots_detected": saved["num_roots_detected"],
+                "growth_direction": saved.get("growth_direction", "down"),
                 "root_mask": saved["root_mask"],
                 "labels": saved["labels"],
                 "skeleton": saved["skeleton"],
