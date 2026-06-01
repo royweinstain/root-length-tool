@@ -1,0 +1,36 @@
+ROOT LENGTH TOOL - HOW TO INSTALL
+=================================
+
+FIRST TIME INSTALL
+------------------
+1. Save this zip file somewhere normal, like your Desktop or Documents.
+2. Right-click the zip file and choose "Extract All...".
+   (Do NOT run the program from inside the zip - it must be extracted first,
+   or it will not work properly.)
+3. Open the extracted "Root Length Tool" folder.
+4. Double-click "Root Length Tool.bat" to start.
+5. The very first launch takes about a minute while it installs what it needs
+   (this requires an internet connection, just once). After that it opens
+   quickly every time.
+
+You need Python installed first. If you don't have it, get it from
+https://www.python.org/downloads/ and make sure to tick
+"Add Python to PATH" during installation.
+
+
+UPDATING FROM AN OLDER VERSION
+------------------------------
+1. Delete (or rename) your old "Root Length Tool" folder.
+   This is safe - you will NOT lose any of your work. Your measurements and
+   saved sessions are stored next to your image files, never inside this
+   folder.
+2. Extract the new zip (steps 1-4 above) and run it.
+3. The first launch of the new version will spend about a minute updating its
+   dependencies (internet needed once), then open as usual.
+
+
+NOTES
+-----
+- Your saved progress for an image is stored as a "_session.pkl" file next to
+  that image, and is loaded automatically when you reopen the same image.
+- CSV measurements are saved wherever you choose when you click "Export CSV".
